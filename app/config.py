@@ -57,3 +57,11 @@ ENROLL_MAX_TEMPLATES: int = 12      # keep up to 12 diverse embeddings
 
 #Pick Diverse Indice function parameter in core/video.py
 DIVERSITY_COSINE_TOL = 0.05
+
+#ERP URL
+ERP_ATTENDANCE_URL = "https://j7lo9j074j.execute-api.ap-south-1.amazonaws.com/attendanceConfirmation"
+
+#Name and Id mapping for ERP
+ERP_USER_MAP = {
+    "rhythm": 72
+}
