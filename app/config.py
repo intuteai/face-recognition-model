@@ -54,3 +54,6 @@ VIDEO_SAMPLE_EVERY: int = 2         # keep every 2nd frame
 VIDEO_MAX_FRAMES: int = 180         # cap before sampling
 ENROLL_MIN_FACE_PX: int = 140       # min face size for enrollment
 ENROLL_MAX_TEMPLATES: int = 12      # keep up to 12 diverse embeddings
+
+#Pick Diverse Indice function parameter in core/video.py
+DIVERSITY_COSINE_TOL = 0.05

@@ -1,11 +1,22 @@
-import logging, pickle, time, uuid
+# app/core/storage.py
+import logging
+import pickle
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-import numpy as np, cv2
+import numpy as np
+import cv2
+
 from app import config
+from app.logging_config import get_logger, timed
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
+
+# ────────────────────────────────────────────────────────────────
+# Dataclass for a single embedding record
+# ────────────────────────────────────────────────────────────────
 @dataclass
 class EmbRecord:
     person_id: str
@@ -13,85 +24,150 @@ class EmbRecord:
     ts: float
     source: str
 
+
+# ────────────────────────────────────────────────────────────────
+# Local embedding storage manager
+# ────────────────────────────────────────────────────────────────
 class LocalStore:
+    """
+    Handles local storage of embeddings and aligned face crops.
+    Embeddings are stored as pickle (index.pkl), crops as JPEGs.
+    """
+
     def __init__(self):
         config.FACES_DIR.mkdir(parents=True, exist_ok=True)
         config.EMBED_DIR.mkdir(parents=True, exist_ok=True)
         self.index_file = config.EMBED_INDEX_FILE
-        self._records = []
-        self._matrix = None
-        self._person = []
+        self._records: list[EmbRecord] = []
+        self._matrix: np.ndarray | None = None
+        self._person: list[str] = []
         self._load()
 
+    # ─────────────────────────────────────────────────────────────
     def _load(self):
+        """Load existing embeddings from disk into memory."""
         if self.index_file.exists():
             with open(self.index_file, "rb") as f:
                 data = pickle.load(f)
             self._records = [
-                EmbRecord(r["person_id"], np.asarray(r["embedding"], np.float32), r["ts"], r["source"])
+                EmbRecord(
+                    r["person_id"],
+                    np.asarray(r["embedding"], np.float32),
+                    r["ts"],
+                    r["source"],
+                )
                 for r in data
             ]
-            log.info("Embeddings loaded", extra={"count": len(self._records)})
+            log.info("embeddings_loaded", extra={"count": len(self._records)})
+        else:
+            log.info("no_existing_index", extra={"file": str(self.index_file)})
         self._rebuild_cache()
 
+    # ─────────────────────────────────────────────────────────────
     def _rebuild_cache(self):
+        """Rebuild in-memory matrix and person list for cosine search."""
         if self._records:
             self._matrix = np.vstack([r.embedding for r in self._records])
             self._person = [r.person_id for r in self._records]
         else:
             self._matrix = np.zeros((0, config.EMB_DIM), np.float32)
             self._person = []
+        log.info(
+            "cache_rebuilt",
+            extra={"records": len(self._records), "unique_people": len(set(self._person))},
+        )
 
+    # ─────────────────────────────────────────────────────────────
     def persist(self):
-        with open(self.index_file, "wb") as f:
-            pickle.dump([r.__dict__ for r in self._records], f)
-        log.info("Embeddings persisted", extra={"count": len(self._records)})
+        """Persist all records to pickle."""
+        with timed(log, "persist_index", count=len(self._records), file=str(self.index_file)):
+            serializable = [
+                {
+                    "person_id": r.person_id,
+                    "embedding": r.embedding.astype(np.float32),
+                    "ts": r.ts,
+                    "source": r.source,
+                }
+                for r in self._records
+            ]
+            with open(self.index_file, "wb") as f:
+                pickle.dump(serializable, f)
+        log.info("persist_done", extra={"count": len(self._records)})
 
-    def save_aligned(self, person_id, aligned_bgr):
+    # ─────────────────────────────────────────────────────────────
+    def save_aligned(self, person_id: str, aligned_bgr: np.ndarray) -> Path:
+        """Save aligned face crop for audit/debugging."""
         pid_dir = config.FACES_DIR / person_id
         pid_dir.mkdir(parents=True, exist_ok=True)
         name = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}.jpg"
         out = pid_dir / name
         cv2.imwrite(str(out), aligned_bgr)
+        log.info("save_crop", extra={"person_id": person_id, "path": str(out)})
         return out
 
-    def add_embeddings(self, person_id, embs, source):
+    # ─────────────────────────────────────────────────────────────
+    def add_embeddings(self, person_id: str, embs: np.ndarray, source: str) -> int:
+        """Add new embeddings and update cache."""
+        if embs is None or embs.size == 0:
+            log.warning("add_embs_empty", extra={"person_id": person_id})
+            return 0
+
         now = time.time()
         for e in embs:
             self._records.append(EmbRecord(person_id, e, now, source))
+        log.info("add_embs", extra={"person_id": person_id, "count": int(embs.shape[0])})
         self.persist()
         self._rebuild_cache()
         return embs.shape[0]
 
-    def search_cosine(self, q, top_k):
+    # ─────────────────────────────────────────────────────────────
+    def search_cosine(self, q: np.ndarray, top_k: int):
         """
-        Returns, for each query vector, a ranked list of unique persons:
-        [{person_id, score}, ...] with score = max cosine among that person's templates.
+        Return, for each query embedding, a ranked list of unique persons:
+        [{person_id, score}, ...]
         """
         if self._matrix is None or len(self._records) == 0:
+            log.info("search_empty")
             return []
-        sims = q @ self._matrix.T  # (B, N) with L2-normalized vectors
+
+        with timed(log, "search_cosine", queries=int(q.shape[0]), db_size=len(self._records)):
+            sims = q @ self._matrix.T  # cosine sim since embeddings are L2-normalized
+
         results = []
         for i in range(q.shape[0]):
-            # collapse by person_id (max similarity)
             agg = {}
             for j, pid in enumerate(self._person):
                 s = float(sims[i, j])
                 if (pid not in agg) or (s > agg[pid]):
                     agg[pid] = s
-            # sort by score desc and take top_k
-            ranked = sorted(({"person_id": pid, "score": sc} for pid, sc in agg.items()),
-                            key=lambda x: -x["score"])[:top_k]
+            ranked = sorted(
+                ({"person_id": pid, "score": sc} for pid, sc in agg.items()),
+                key=lambda x: -x["score"],
+            )[:top_k]
             results.append(ranked)
+
+        log.info(
+            "search_done",
+            extra={
+                "queries": int(q.shape[0]),
+                "unique_people": len(set(self._person)),
+                "top_k": top_k,
+            },
+        )
         return results
 
-    def people(self):
+    # ─────────────────────────────────────────────────────────────
+    def people(self) -> dict[str, int]:
+        """Return dict of person_id → embedding count."""
         counts = {}
         for r in self._records:
             counts[r.person_id] = counts.get(r.person_id, 0) + 1
+        log.info("people_summary", extra={"unique_people": len(counts)})
         return counts
 
-    def delete_person(self, person_id):
+    # ─────────────────────────────────────────────────────────────
+    def delete_person(self, person_id: str) -> int:
+        """Delete all embeddings and crops for a person."""
         before = len(self._records)
         self._records = [r for r in self._records if r.person_id != person_id]
         pid_dir = config.FACES_DIR / person_id
@@ -101,4 +177,6 @@ class LocalStore:
             pid_dir.rmdir()
         self.persist()
         self._rebuild_cache()
-        return before - len(self._records)
+        removed = before - len(self._records)
+        log.info("delete_person", extra={"person_id": person_id, "removed": removed})
+        return removed

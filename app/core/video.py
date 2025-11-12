@@ -1,33 +1,32 @@
-# app/core/video.py
 from __future__ import annotations
-import io
-import math
 import cv2
+import tempfile
+import os
 import numpy as np
-from typing import List, Tuple
+from typing import List
+from app.logging_config import get_logger, timed
+from app import config
 
-def iter_video_frames_from_bytes(video_bytes: bytes,
-                                 sample_every: int = 2,
-                                 max_frames: int = 180) -> List[np.ndarray]:
-    """
-    Decode video bytes with OpenCV and yield BGR frames.
-    sample_every=2 -> keep every 2nd frame
-    max_frames is the cap before sampling (for safety)
-    """
-    # Write bytes to a memory buffer (OpenCV prefers filenames; we use cv2.imdecode for images,
-    # but for video we use a temp memory file via cv2.VideoCapture with a named pipe-like trick)
-    # Simplest cross-platform: write to a tmp file-like buffer on disk.
-    # However, to avoid deps, we use a simple approach: save to /tmp then delete.
-    import tempfile, os
+log = get_logger(__name__)
+
+def iter_video_frames_from_bytes(video_bytes: bytes, sample_every: int = 2, max_frames: int = 180) -> List[np.ndarray]:
+    log.info("video_read", extra={"bytes": len(video_bytes)})
+    # write bytes to a temporary file for OpenCV VideoCapture
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
         f.write(video_bytes)
         tmp_path = f.name
 
     cap = cv2.VideoCapture(tmp_path)
-    frames = []
-    idx = 0
-    kept = 0
-    try:
+    if not cap.isOpened():
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        # Fail cleanly so API returns JSON instead of 500
+        raise ValueError("Could not open video (unsupported codec or corrupt file)")
+
+    frames, idx, kept = [], 0, 0
+    with timed(log, "video_decode"):
         while kept < max_frames:
             ok, frame = cap.read()
             if not ok:
@@ -36,29 +35,64 @@ def iter_video_frames_from_bytes(video_bytes: bytes,
                 frames.append(frame)
                 kept += 1
             idx += 1
-    finally:
-        cap.release()
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+    cap.release()
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    log.info("video_frames", extra={"decoded": idx, "kept": len(frames), "sample_every": sample_every})
     return frames
 
-def pick_diverse_indices(embs: np.ndarray,
-                         max_keep: int = 12,
-                         dedupe_cosine: float = 0.95) -> List[int]:
+import numpy as np
+
+import numpy as np
+from app.logging_config import get_logger
+log = get_logger(__name__)
+
+def pick_diverse_indices(
+    embeddings: np.ndarray,
+    max_keep: int = 20,
+    dedupe_cosine: float = config.DIVERSITY_COSINE_TOL,
+):
     """
-    Greedy selection: start with the sharpest/best order externally,
-    drop near-duplicates (> dedupe_cosine), keep up to max_keep.
-    Expects embs L2-normalized.
+    Select up to `max_keep` diverse embeddings by cosine distance.
+
+    Args:
+        embeddings (np.ndarray): (N, D) L2-normalized embeddings
+        max_keep (int): number of diverse samples to keep
+        dedupe_cosine (float): threshold; embeddings with cosine sim > 1 - dedupe_cosine are considered too similar
+
+    Returns:
+        list[int]: indices of selected embeddings
     """
-    keep: List[int] = []
-    for i in range(embs.shape[0]):
-        if len(keep) == 0:
-            keep.append(i); continue
-        sim = (embs[i][None, :] @ embs[keep].T).max()
-        if sim < dedupe_cosine:
-            keep.append(i)
-        if len(keep) >= max_keep:
+    n = embeddings.shape[0]
+    if n <= max_keep:
+        log.debug("pick_diverse_indices: small set", extra={"n": n})
+        return list(range(n))
+
+    # ensure embeddings are normalized
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+    embs = embeddings / norms
+
+    keep = [0]  # start with first vector
+    used = np.zeros(n, dtype=bool)
+    used[0] = True
+
+    for _ in range(1, max_keep):
+        sims = embs @ embs[keep[-1]].T  # cosine similarity to last kept
+        sims = np.clip(sims, -1, 1)
+        sims[used] = 1.0
+        idx = np.argmin(sims)
+        if 1 - sims[idx] < dedupe_cosine:
             break
+        keep.append(idx)
+        used[idx] = True
+
+    log.info(
+        "pick_diverse_indices_done",
+        extra={"total": n, "kept": len(keep), "dedupe_cosine": dedupe_cosine},
+    )
     return keep
+
+

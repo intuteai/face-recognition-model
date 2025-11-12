@@ -1,15 +1,12 @@
-import logging
+import logging, numpy as np
 from app.core.detector import FaceDetector
 from app.core.align import align_5pts
 from app.core.embedder import FaceEmbedder
 from app.core.storage import LocalStore
+from app.logging_config import timed, get_logger
 from app import config
-from app.core.video import iter_video_frames_from_bytes, pick_diverse_indices
-from app.core.quality import face_quality_scores, passes_quality
-import numpy as np
 
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 class Pipeline:
     def __init__(self):
@@ -18,18 +15,66 @@ class Pipeline:
         self.db = LocalStore()
 
     def enroll_image(self, img, person_id, source):
-        bboxes, kps = self.det.detect(img)
-        aligned = [align_5pts(img, k) for k in kps]
-        for a in aligned:
-            self.db.save_aligned(person_id, a)
-        embs = self.emb.embed(aligned)
+        log.info("enroll_image_in", extra={"person_id": person_id, "source": source})
+        with timed(log, "enroll_detect"):
+            bboxes, kps = self.det.detect(img)
+        aligned = []
+        for i in range(len(bboxes)):
+            a = align_5pts(img, kps[i]); aligned.append(a)
+        log.info("enroll_align", extra={"aligned": len(aligned)})
+        with timed(log, "enroll_embed", faces=len(aligned)):
+            embs = self.emb.embed(aligned)
         added = self.db.add_embeddings(person_id, embs, source)
+        log.info("enroll_image_out", extra={"person_id": person_id, "faces": len(aligned), "embeddings": added})
         return {"faces": len(aligned), "embeddings_added": added}
 
+    def enroll_video(self, video_bytes, person_id, source,
+                     sample_every=2, min_face_size_px=140, max_frames_considered=180, max_templates=12):
+        log.info("enroll_video_in", extra={"person_id": person_id, "source": source})
+        from app.core.video import iter_video_frames_from_bytes, pick_diverse_indices
+        from app.core.quality import face_quality_scores, passes_quality
+
+        frames = iter_video_frames_from_bytes(video_bytes, sample_every=sample_every, max_frames=max_frames_considered)
+        total_detected = 0; aligned_faces = []; qinfo = []
+
+        for fr in frames:
+            bboxes, kps = self.det.detect(fr)
+            if bboxes.shape[0] == 0: continue
+            areas = (bboxes[:,2]-bboxes[:,0]) * (bboxes[:,3]-bboxes[:,1])
+            idx = int(np.argmax(areas))
+            w = bboxes[idx][2]-bboxes[idx][0]; h = bboxes[idx][3]-bboxes[idx][1]
+            if min(w, h) < min_face_size_px: continue
+            a = align_5pts(fr, kps[idx]); q = face_quality_scores(a)
+            if not passes_quality(q): continue
+            aligned_faces.append(a); qinfo.append(q); total_detected += 1
+
+        log.info("video_selected_faces", extra={"detected": total_detected, "kept_quality": len(aligned_faces)})
+
+        embs = self.emb.embed(aligned_faces)
+        ranked = sorted(range(len(aligned_faces)),
+                        key=lambda i: (qinfo[i]["sharpness"], -abs(qinfo[i]["brightness"]-128)),
+                        reverse=True)
+        embs_ranked = embs[ranked]
+        idx_keep = pick_diverse_indices(embs_ranked, max_keep=max_templates, dedupe_cosine=0.95)
+        final_embs = embs_ranked[idx_keep]
+        final_faces = [aligned_faces[ranked[i]] for i in idx_keep]
+
+        for a in final_faces:
+            self.db.save_aligned(person_id, a)
+        added = self.db.add_embeddings(person_id, final_embs, source)
+        log.info("enroll_video_out", extra={"person_id": person_id, "frames": len(frames),
+                                            "faces_kept": len(final_faces), "embeddings": int(added)})
+        return {"frames_total": len(frames), "frames_detected": total_detected,
+                "faces_kept": len(final_faces), "embeddings_added": int(added)}
+
     def recognize_image(self, img):
-        bboxes, kps = self.det.detect(img)
+        log.info("recognize_in")
+        with timed(log, "recognize_detect"):
+            bboxes, kps = self.det.detect(img)
         aligned = [align_5pts(img, k) for k in kps]
-        embs = self.emb.embed(aligned)
+        log.info("recognize_align", extra={"aligned": len(aligned)})
+        with timed(log, "recognize_embed", faces=len(aligned)):
+            embs = self.emb.embed(aligned)
         sims = self.db.search_cosine(embs, top_k=config.TOP_K)
         out = []
         for i in range(len(bboxes)):
@@ -41,66 +86,5 @@ class Pipeline:
                 "prediction": {"person_id": label, "similarity": best["score"]},
                 "top_k": sims[i],
             })
+        log.info("recognize_out", extra={"faces": len(out)})
         return out
-    
-    def enroll_video(self, video_bytes: bytes, person_id: str, source: str,
-                     sample_every: int = 2,
-                     min_face_size_px: int = 140,
-                     max_frames_considered: int = 180,
-                     max_templates: int = 12) -> dict:
-        # 1) decode & sample frames
-        frames = iter_video_frames_from_bytes(video_bytes, sample_every=sample_every,
-                                              max_frames=max_frames_considered)
-        if not frames:
-            return {"faces": 0, "embeddings_added": 0, "note": "no frames decoded"}
-
-        aligned_faces = []
-        qinfo = []  # quality info for ranking
-        total_detected = 0
-
-        # 2) detect & align
-        for fr in frames:
-            bboxes, kps = self.det.detect(fr)
-            if bboxes.shape[0] == 0:
-                continue
-            # pick largest face only (assuming single subject during enroll)
-            areas = (bboxes[:,2]-bboxes[:,0]) * (bboxes[:,3]-bboxes[:,1])
-            idx = int(np.argmax(areas))
-            x1,y1,x2,y2,score = bboxes[idx]
-            if min(x2-x1, y2-y1) < min_face_size_px:
-                continue
-            a = align_5pts(fr, kps[idx])
-            q = face_quality_scores(a)
-            if not passes_quality(q):
-                continue
-            aligned_faces.append(a)
-            qinfo.append(q)
-            total_detected += 1
-
-        if not aligned_faces:
-            return {"faces": 0, "embeddings_added": 0, "note": "no usable faces passed quality"}
-
-        # 3) embed all kept faces
-        embs = self.emb.embed(aligned_faces)   # (N, D), L2-normalized already
-        # Rank by simple composite: sharpness primary, brightness closeness secondary
-        ranked = sorted(range(len(aligned_faces)),
-                        key=lambda i: (qinfo[i]["sharpness"], -abs(qinfo[i]["brightness"]-128)),
-                        reverse=True)
-
-        embs_ranked = embs[ranked]
-        idx_keep = pick_diverse_indices(embs_ranked, max_keep=max_templates, dedupe_cosine=0.95)
-
-        final_embs = embs_ranked[idx_keep]
-        final_faces = [aligned_faces[ranked[i]] for i in idx_keep]
-
-        # 4) persist crops (optional) + embeddings
-        for a in final_faces:
-            self.db.save_aligned(person_id, a)
-        added = self.db.add_embeddings(person_id, final_embs, source)
-
-        return {
-            "frames_total": len(frames),
-            "frames_detected": total_detected,
-            "faces_kept": len(final_faces),
-            "embeddings_added": int(added),
-        }
