@@ -1,0 +1,98 @@
+name: Build, Push & Deploy to VPS
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: face-recognition-api
+  cancel-in-progress: false
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/face-recognition-api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # QEMU not needed since we're only building amd64
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+  deploy-to-vps:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Deploy to GoDaddy VPS via SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
+          script_stop: true
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,REGISTRY,IMAGE_NAME
+          script: |
+            set -eo pipefail
+
+            echo "Pruning old Docker images and containers..."
+            docker system prune -af --volumes || true
+
+            echo "Logging in to Docker Hub on VPS..."
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            IMAGE="${REGISTRY}/${IMAGE_NAME}:latest"
+            CONTAINER_NAME="face-recognition-api"
+
+            echo "Pulling image: ${IMAGE}"
+            docker pull "${IMAGE}"
+
+            echo "Stopping/removing existing container if present..."
+            if [ "$(docker ps -aq -f name="^${CONTAINER_NAME}$")" ]; then
+              docker rm -f "${CONTAINER_NAME}" || true
+            fi
+
+            echo "Starting new container..."
+            docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              "${IMAGE}"
+
+            echo "Deployment complete. Current status:"
+            docker ps --filter "name=${CONTAINER_NAME}"
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REGISTRY: docker.io
+          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/face-recognition-api
