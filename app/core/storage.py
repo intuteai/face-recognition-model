@@ -11,7 +11,7 @@ import cv2
 from app import config
 from app.logging_config import get_logger, timed
 
-log = get_logger(_name_)
+log = get_logger(__name__)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ class LocalStore:
     Embeddings are stored as pickle (index.pkl), crops as JPEGs.
     """
 
-    def _init_(self):
+    def __init__(self):
         config.EMBED_DIR.mkdir(parents=True, exist_ok=True)
         self.index_file = config.EMBED_INDEX_FILE
         self._records: list[EmbRecord] = []

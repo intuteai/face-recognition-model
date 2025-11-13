@@ -1,12 +1,12 @@
 # app/config.py
-from _future_ import annotations
+from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 import os
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Make BASE_DIR = .../AttendanceSystem/app
-BASE_DIR: Path = Path(_file_).resolve().parent
+BASE_DIR: Path = Path(__file__).resolve().parent
 # Models live in project_root/models
 MODELS_DIR: Path = BASE_DIR.parent / "models"
 # Data lives in project_root/data
